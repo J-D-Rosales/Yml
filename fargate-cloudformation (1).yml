@@ -1,0 +1,157 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ECS Fargate Service (ALB + Logs) for a Dockerized Node.js API.
+  Creates: VPC-bound security groups, ALB, Target Group + Listener, ECS Cluster,
+  Task Definition and Service. Uses a pre-existing IAM role (LabRole) for
+  both TaskRole and ExecutionRole.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: node-crud-api
+    Description: Logical name prefix for all resources.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where the ALB and tasks will run.
+  Subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two subnets in the selected VPC (usually public subnets).
+  ImageUrl:
+    Type: String
+    Description: Full image URI (ECR or Docker Hub), e.g., 123456789012.dkr.ecr.us-east-1.amazonaws.com/repo:tag or docker.io/username/repo:tag
+  ContainerPort:
+    Type: Number
+    Default: 3000
+    Description: API listening port exposed by the container.
+  DesiredCount:
+    Type: Number
+    Default: 1
+    Description: Number of desired tasks.
+  LabRoleArn:
+    Type: String
+    Description: ARN of the LabRole to use as TaskRole and ExecutionRole (e.g., arn:aws:iam::478701513931:role/LabRole)
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${AppName}
+      RetentionInDays: 7
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${AppName}-cluster
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ALB SG for ${AppName}
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ECS tasks SG for ${AppName}
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${AppName}-alb
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref Subnets
+      SecurityGroups: [!Ref ALBSecurityGroup]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${AppName}-tg
+      TargetType: ip
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: !Ref ContainerPort
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: '200-399'
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${AppName}-task
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: ['FARGATE']
+      ExecutionRoleArn: !Ref LabRoleArn
+      TaskRoleArn: !Ref LabRoleArn
+      ContainerDefinitions:
+        - Name: !Sub ${AppName}-container
+          Image: !Ref ImageUrl
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      ServiceName: !Sub ${AppName}-service
+      Cluster: !Ref Cluster
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups: [!Ref AppSecurityGroup]
+          Subnets: !Ref Subnets
+      LoadBalancers:
+        - ContainerName: !Sub ${AppName}-container
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  AlbDNSName:
+    Description: Public DNS for the ALB
+    Value: !GetAtt LoadBalancer.DNSName
+  ClusterName:
+    Description: ECS Cluster name
+    Value: !Ref Cluster
+  ServiceName:
+    Description: ECS Service name
+    Value: !Ref Service
